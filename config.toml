@@ -1,0 +1,101 @@
+# apikeyfinder — trufflehog automator configuration
+# All numbers are plain integers; byte sizes are in bytes (0 = unlimited/disabled where noted).
+
+progress_interval_secs = 10        # top-level key: must come before any [section]
+
+[targets]
+# Common Crawl CDX collection to query
+index_collection = "CC-MAIN-2026-39"
+index_base_url = "https://index.commoncrawl.org"
+data_base_url = "https://data.commoncrawl.org"
+# Wildcard url patterns for the index query (all fetched through the central network queue)
+url_patterns = ["*.org/*", "*.com/*", "*.net/*", "*.io/*", "*.dev/*", "*.info/*", "*.co/*"]
+# Max CDX lines fetched per pattern (sample breadth without timing out the flaky index)
+per_pattern_limit = 5000
+# Keep searching until at least this many candidate WARC files are known (warn if not reached)
+min_candidate_files = 12
+# Total compressed WARC bytes to download (4 GiB)
+target_bytes = 4294967296
+# Safety cap on a single index response
+max_index_response_bytes = 536870912
+# Stagger between individual pattern queries (CDX frontends 503 under bursts)
+pattern_stagger_ms = 200
+# Whole-query retry rounds for patterns that failed at the transport level
+max_select_rounds = 3
+# Cool-down between rounds, multiplied by the round number (the public index
+# needs breathing room; instant retries only extend its overload)
+round_cooldown_secs = 20
+# Abort the run after this many consecutive HEAD size-probes without a usable
+# size (mass refusals/zero-length mean we're blocked or data_base_url is wrong)
+head_probe_abort_after = 30
+
+# Stage 1 — pre-download "good content" filter (applied client-side always;
+# optionally also pushed into the CDX query with server_mime_filter)
+[filter.index]
+mime_regex = ".*(text/.*|javascript|json|xml).*"
+status_regex = "200"
+server_mime_filter = false         # many pywb frontends 404 on regex-heavy filters
+extra_cdx_filters = []          # appended verbatim, e.g. "filter=urlkey:.*github.*"
+only_warc_path = true           # skip robotstxt/crawldiagnostics WARCs
+
+# Stage 2 — awk record filter applied while splitting on WARC/1.0 headers
+[filter.records]
+warc_type_regex = "^response$"
+content_type_regex = "^(text/|application/(json|javascript|xml))"
+min_payload_bytes = 64
+max_payload_bytes = 0           # 0 = unlimited
+payload_include_regex = ""      # optional expensive body regex; empty = off
+drop_invalid_records = true     # reject records failing WARC/1.0 + Content-Length validation
+
+[download]
+parallel_fetches = 3            # max concurrent fetches (= max network workers); 1 = sequential
+max_bytes_per_file = 0          # 0 = full file; >0 uses HTTP Range for partial downloads (testing)
+max_retries = 4
+retry_backoff_ms = 1500            # base for exponential backoff: ~1.5s, 3s, 6s, 12s (±jitter, 60s cap)
+connect_timeout_secs = 30
+request_timeout_secs = 900
+head_timeout_secs = 45              # size probes fail fast on dead CDN edges (retries pick fresh ones)
+
+[split]
+records_per_chunk = 256
+max_chunk_bytes = 8388608       # flush awk chunk early at 8 MiB
+max_concurrent = 2              # concurrent decompress+awk split jobs
+awk_binary = "awk"
+
+[scan]
+binary = "trufflehog"
+only_verified = true
+no_update = false                 # Debian /usr/bin/trufflehog is a wrapper that already passes --no-update
+log_level = -1                  # trufflehog stderr verbosity; -1 = quiet
+trufflehog_concurrency = 8      # trufflehog's own --concurrency
+workers = 2                     # concurrent trufflehog processes
+extra_args = []
+snippet_window_chars = 512      # context kept on each side of the secret in the stored snippet
+artifact_max_bytes = 0          # skip a source record bigger than this (0 = unlimited)
+
+[cache]
+mem_limit_bytes = 2147483648    # 2 GiB — findings spill to disk beyond this
+spill_dir = "results/spill"
+spill_file_bytes = 1073741824   # rotate spill files at 1 GiB
+final_output = "results/findings.jsonl"
+
+[queues]
+network_capacity = 64           # queued fetch jobs before senders wait
+network_min_workers = 1
+network_scale_threshold = 2     # spawn extra workers when this many jobs are waiting
+network_idle_retire_ms = 10000  # idle workers above min retire after this
+network_pool_tick_ms = 100
+disk_workers = 4
+disk_capacity = 128
+ram_capacity = 16384
+
+[paths]
+workdir = "work"
+keep_warcs = false              # delete .warc.gz after successful split
+keep_chunks = false             # delete chunk dirs after successful scan
+checkpoint_file = "results/checkpoint.json"  # resume state (plan + per-WARC completion)
+partials_dir = "results/partials"            # durable per-WARC findings; feed the cache
+artifacts_dir = "results/artifacts"          # source WARC record per finding (never purged)
+# work/ and spill files are purged at startup and on SIGINT/SIGTERM/SIGHUP.
+# results/artifacts (like partials/findings) survives — the viewer points at it.
+# Delete results/checkpoint.json (+ results/partials) to start a fresh scan.
