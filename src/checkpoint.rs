@@ -63,7 +63,8 @@ pub struct CompletedWarc {
 #[serde(default)]
 pub struct Checkpoint {
     pub version: u32,
-    /// The download plan, fixed the first time targets are selected.
+    /// The download plan, fixed the first time targets are selected and
+    /// extended by one batch per drain when `targets.unlimited` is set.
     pub targets: Vec<WarcTarget>,
     /// WARC base name -> findings committed for it.
     pub completed: BTreeMap<String, CompletedWarc>,

@@ -27,6 +27,12 @@ index. Startup purges stale downloads; SIGINT/SIGTERM/SIGHUP clean up
 `work/` and the spill dir and keep the resume state. `results/`
 (partials, artifacts, findings) is never touched by cleanup.
 
+Set `targets.unlimited = true` to keep scanning past the end of the plan:
+once a batch drains, the pipeline queries the index again for the next
+`target_bytes` worth of *unseen* WARCs, appends them to the checkpointed
+plan, and continues until you Ctrl-C. If the index has nothing new left, or
+an entire batch fails, it finishes cleanly instead of looping.
+
 ## Quick start
 
 ```sh
@@ -47,7 +53,8 @@ also want to discard the findings from the old plan).
 |---|---|---|
 | `targets` | `index_collection` | Common Crawl collection to query |
 | `targets` | `url_patterns`, `per_pattern_limit` | breadth of the CDX sampling |
-| `targets` | `target_bytes` | total compressed WARC bytes for one run |
+| `targets` | `target_bytes` | total compressed WARC bytes for one run (batch size if `unlimited`) |
+| `targets` | `unlimited` | plan another batch after each drain, until Ctrl-C |
 | `filter.records` | mime / status / size rules | which records reach trufflehog |
 | `download` | `parallel_fetches` | concurrent WARC downloads |
 | `scan` | `only_verified` | keep only trufflehog-verified findings |

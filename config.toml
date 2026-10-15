@@ -16,6 +16,10 @@ per_pattern_limit = 5000
 min_candidate_files = 12
 # Total compressed WARC bytes to download (4 GiB)
 target_bytes = 4294967296
+# Keep scanning after this plan is done: every drained batch is followed by
+# another index round that plans target_bytes more WARCs (unseen only),
+# until Ctrl-C. target_bytes is the batch size; requires > 0.
+unlimited = true
 # Safety cap on a single index response
 max_index_response_bytes = 536870912
 # Stagger between individual pattern queries (CDX frontends 503 under bursts)

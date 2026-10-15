@@ -6,7 +6,7 @@
 //! filter can't weaken them), then probes candidate file sizes with HEAD
 //! requests until `targets.target_bytes` of downloads is scheduled.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -150,7 +150,37 @@ async fn query_round(
     (failed, accepted_any)
 }
 
-pub async fn select_warcs(cfg: &Config, net: &NetworkQueue, stats: &Stats) -> Result<Vec<WarcTarget>> {
+/// Rank CDX candidates densest good-content first, dropping every WARC path
+/// already in the plan so a follow-up batch only sees unseen files.
+fn rank_candidates(
+    agg: HashMap<String, (usize, u64)>,
+    exclude: &HashSet<String>,
+) -> Vec<(String, usize, u64)> {
+    let mut candidates: Vec<(String, usize, u64)> = agg
+        .into_iter()
+        .map(|(path, (hits, rec_bytes))| (path, hits, rec_bytes))
+        .collect();
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+    if !exclude.is_empty() {
+        let before = candidates.len();
+        candidates.retain(|(path, ..)| !exclude.contains(path));
+        tracing::info!(
+            excluded = before - candidates.len(),
+            unseen = candidates.len(),
+            "excluding already-planned WARC(s)"
+        );
+    }
+    candidates
+}
+
+/// `exclude` holds the WARC paths of the running plan; pass an empty set for
+/// the initial plan. Returns an empty vec when nothing new is left to plan.
+pub async fn select_warcs(
+    cfg: &Config,
+    net: &NetworkQueue,
+    stats: &Stats,
+    exclude: &HashSet<String>,
+) -> Result<Vec<WarcTarget>> {
     if cfg.targets.target_bytes == 0 {
         tracing::info!("targets.target_bytes = 0 — nothing to download");
         return Ok(Vec::new());
@@ -202,11 +232,12 @@ pub async fn select_warcs(cfg: &Config, net: &NetworkQueue, stats: &Stats) -> Re
     }
 
     // Densest files first: files with the most matching "good content" records.
-    let mut candidates: Vec<(String, usize, u64)> = agg
-        .into_iter()
-        .map(|(path, (hits, rec_bytes))| (path, hits, rec_bytes))
-        .collect();
-    candidates.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+    let candidates = rank_candidates(agg, exclude);
+
+    if candidates.is_empty() {
+        tracing::info!("every index candidate is already in the plan; nothing new to schedule");
+        return Ok(Vec::new());
+    }
 
     if candidates.len() < cfg.targets.min_candidate_files {
         tracing::warn!(
@@ -259,7 +290,11 @@ pub async fn select_warcs(cfg: &Config, net: &NetworkQueue, stats: &Stats) -> Re
     }
 
     if selected.is_empty() {
-        bail!("could not determine sizes for any candidate WARC file");
+        if exclude.is_empty() {
+            bail!("could not determine sizes for any candidate WARC file");
+        }
+        tracing::info!("no unseen candidate WARC could be sized; nothing new to schedule");
+        return Ok(Vec::new());
     }
     if total < cfg.targets.target_bytes {
         tracing::warn!(
@@ -271,10 +306,7 @@ pub async fn select_warcs(cfg: &Config, net: &NetworkQueue, stats: &Stats) -> Re
 
     stats
         .downloads_selected_bytes
-        .store(total, std::sync::atomic::Ordering::Relaxed);
-    stats
-        .warcs_total
-        .store(selected.len(), std::sync::atomic::Ordering::Relaxed);
+        .fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     tracing::info!(
         files = selected.len(),
         bytes = total,
@@ -308,6 +340,26 @@ mod tests {
         assert_eq!(agg.len(), 1);
         let (hits, bytes) = agg.values().next().unwrap();
         assert_eq!((*hits, *bytes), (1, 100));
+    }
+
+    #[test]
+    fn rank_candidates_sorts_by_density_and_excludes_planned() {
+        let mut agg = HashMap::new();
+        agg.insert("crawl-data/a.warc.gz".to_string(), (10usize, 1000u64));
+        agg.insert("crawl-data/b.warc.gz".to_string(), (50, 100));
+        agg.insert("crawl-data/c.warc.gz".to_string(), (50, 900));
+
+        let ranked = rank_candidates(agg.clone(), &HashSet::new());
+        assert_eq!(
+            ranked.iter().map(|(p, ..)| p.as_str()).collect::<Vec<_>>(),
+            ["crawl-data/c.warc.gz", "crawl-data/b.warc.gz", "crawl-data/a.warc.gz"],
+            "hit density first, record bytes break ties"
+        );
+
+        let exclude: HashSet<String> = ["crawl-data/c.warc.gz".to_string()].into_iter().collect();
+        let ranked = rank_candidates(agg, &exclude);
+        assert_eq!(ranked.len(), 2);
+        assert!(ranked.iter().all(|(p, ..)| p != "crawl-data/c.warc.gz"));
     }
 
     #[test]

@@ -29,6 +29,10 @@ pub struct TargetsCfg {
     pub per_pattern_limit: usize,
     pub min_candidate_files: usize,
     pub target_bytes: u64,
+    /// Keep going after the current plan is exhausted: each drained batch is
+    /// followed by another CDX round that plans `target_bytes` more WARCs
+    /// (unseen only), until Ctrl-C. `target_bytes` is the batch size.
+    pub unlimited: bool,
     pub max_index_response_bytes: u64,
     /// Delay between firing individual pattern queries (some CDX frontends 503 under burst load).
     pub pattern_stagger_ms: u64,
@@ -187,6 +191,7 @@ impl Default for TargetsCfg {
             per_pattern_limit: 5000,
             min_candidate_files: 12,
             target_bytes: 4 * GIB,
+            unlimited: false,
             max_index_response_bytes: 512 * 1024 * 1024,
             pattern_stagger_ms: 200,
             max_select_rounds: 3,
@@ -335,6 +340,10 @@ impl Config {
             self.targets.head_probe_abort_after >= 1,
             "targets.head_probe_abort_after must be >= 1"
         );
+        anyhow::ensure!(
+            !(self.targets.unlimited && self.targets.target_bytes == 0),
+            "targets.unlimited requires targets.target_bytes > 0 (batch size)"
+        );
         regex::Regex::new(&self.filter.index.mime_regex).context("filter.index.mime_regex is not a valid regex")?;
         regex::Regex::new(&self.filter.index.status_regex).context("filter.index.status_regex is not a valid regex")?;
         regex::Regex::new(&self.filter.records.warc_type_regex)
@@ -363,6 +372,7 @@ mod tests {
         let cfg: Config = toml::from_str("").unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.targets.target_bytes, 4 * GIB);
+        assert!(!cfg.targets.unlimited);
         assert_eq!(cfg.cache.mem_limit_bytes, 2 * GIB);
         assert_eq!(cfg.download.parallel_fetches, 3);
         assert!(cfg.scan.only_verified);
@@ -381,6 +391,7 @@ mod tests {
             r#"
             [targets]
             target_bytes = 67108864
+            unlimited = true
             [cache]
             mem_limit_bytes = 20000
             [scan]
@@ -390,11 +401,22 @@ mod tests {
         .unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.targets.target_bytes, 67108864);
+        assert!(cfg.targets.unlimited);
         assert_eq!(cfg.cache.mem_limit_bytes, 20000);
         assert!(!cfg.scan.only_verified);
 
         let bad = toml::from_str::<Config>("[targets]\nbogus_key = 1\n");
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn unlimited_requires_a_batch_size() {
+        let mut cfg = Config::default();
+        cfg.targets.unlimited = true;
+        cfg.targets.target_bytes = 0;
+        assert!(cfg.validate().is_err());
+        cfg.targets.target_bytes = GIB;
+        cfg.validate().unwrap();
     }
 
     #[test]

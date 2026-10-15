@@ -6,6 +6,7 @@ mod scan;
 mod split;
 mod stats;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -68,7 +69,8 @@ async fn main() -> Result<()> {
     tokio::spawn(progress_loop(stats.clone(), net.clone(), cfg.clone()));
 
     // Resume state: the download plan is fixed the first time targets are
-    // selected and reused by every later run.
+    // selected and reused by every later run (targets.unlimited appends new
+    // batches to it once the previous batch drains).
     let cp = Arc::new(Mutex::new(Checkpoint::load(&cfg)?));
     let saved: Option<Vec<WarcTarget>> = {
         let g = cp.lock().unwrap_or_else(|e| e.into_inner());
@@ -83,86 +85,136 @@ async fn main() -> Result<()> {
             t
         }
         None => {
-            let t = cdx::select_warcs(&cfg, &net, &stats).await?;
+            let t = cdx::select_warcs(&cfg, &net, &stats, &HashSet::new()).await?;
             let mut g = cp.lock().unwrap_or_else(|e| e.into_inner());
             g.targets = t.clone();
             g.save(&cfg)?;
             t
         }
     };
-    let (pending, cached) = {
-        let g = cp.lock().unwrap_or_else(|e| e.into_inner());
-        let mut pending = Vec::new();
-        let mut cached = 0usize;
-        for t in &targets {
-            if g.is_complete(&warc_name(&t.path)) {
-                cached += 1;
-            } else {
-                pending.push(t.clone());
-            }
-        }
-        (pending, cached)
-    };
-    stats.warcs_total.store(pending.len(), Ordering::Relaxed);
-    stats.warcs_cached.store(cached, Ordering::Relaxed);
-    if targets.is_empty() {
-        tracing::warn!("no download targets; finishing after cache flush");
-    }
-    if cached > 0 {
-        tracing::info!(
-            already_done = cached,
-            remaining = pending.len(),
-            total = targets.len(),
-            "resume: skipping completed WARC(s)"
-        );
-    }
-
     // Stage 2-4, chained per remaining file: download -> awk split -> scan -> commit.
     let split_sem = Arc::new(Semaphore::new(cfg.split.max_concurrent));
     let scan_sem = Arc::new(Semaphore::new(cfg.scan.workers));
     let mut set: JoinSet<Result<()>> = JoinSet::new();
-    for target in pending {
-        set.spawn(run_pipeline(
-            target,
-            cfg.clone(),
-            net.clone(),
-            disk.clone(),
-            ram.clone(),
-            stats.clone(),
-            split_sem.clone(),
-            scan_sem.clone(),
-            cp.clone(),
-        ));
-    }
 
     let mut ok = 0usize;
     let mut failed = 0usize;
     let mut errors: Vec<String> = Vec::new();
     let mut shutdown_rx = shutdown_rx;
     let mut interrupted = false;
-    loop {
-        tokio::select! {
-            biased;
-            changed = shutdown_rx.changed() => {
-                let _ = changed;
-                interrupted = true;
-                break;
-            }
-            maybe = set.join_next() => match maybe {
-                None => break,
-                Some(Ok(Ok(()))) => ok += 1,
-                Some(Ok(Err(e))) => {
-                    failed += 1;
-                    stats.inc_usize(&stats.warcs_failed);
-                    errors.push(format!("{e:#}"));
+    let mut cached_total = 0usize;
+    // The plan this run schedules from. With targets.unlimited it grows by one
+    // batch every time the previous batch has fully drained.
+    let mut planned = targets;
+
+    let mut batch = 0usize;
+    'batches: loop {
+        batch += 1;
+        let (pending, cached) = {
+            let g = cp.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pending = Vec::new();
+            let mut cached = 0usize;
+            for t in &planned {
+                if g.is_complete(&warc_name(&t.path)) {
+                    cached += 1;
+                } else {
+                    pending.push(t.clone());
                 }
-                Some(Err(e)) => {
-                    failed += 1;
-                    stats.inc_usize(&stats.warcs_failed);
-                    errors.push(format!("pipeline task panicked: {e}"));
+            }
+            (pending, cached)
+        };
+        cached_total += cached;
+        stats.warcs_total.fetch_add(pending.len(), Ordering::Relaxed);
+        stats.warcs_cached.store(cached_total, Ordering::Relaxed);
+        if planned.is_empty() && batch == 1 {
+            tracing::warn!("no download targets; finishing after cache flush");
+        }
+        if cached > 0 {
+            tracing::info!(
+                already_done = cached,
+                remaining = pending.len(),
+                total = planned.len(),
+                "resume: skipping completed WARC(s)"
+            );
+        }
+
+        for target in pending {
+            set.spawn(run_pipeline(
+                target,
+                cfg.clone(),
+                net.clone(),
+                disk.clone(),
+                ram.clone(),
+                stats.clone(),
+                split_sem.clone(),
+                scan_sem.clone(),
+                cp.clone(),
+            ));
+        }
+
+        // Drain this batch; a signal aborts the whole run from here.
+        let mut batch_ok = 0usize;
+        let mut batch_failed = 0usize;
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    let _ = changed;
+                    interrupted = true;
+                    break 'batches;
+                }
+                maybe = set.join_next() => match maybe {
+                    None => break,
+                    Some(Ok(Ok(()))) => { ok += 1; batch_ok += 1; }
+                    Some(Ok(Err(e))) => {
+                        failed += 1;
+                        batch_failed += 1;
+                        stats.inc_usize(&stats.warcs_failed);
+                        errors.push(format!("{e:#}"));
+                    }
+                    Some(Err(e)) => {
+                        failed += 1;
+                        batch_failed += 1;
+                        stats.inc_usize(&stats.warcs_failed);
+                        errors.push(format!("pipeline task panicked: {e}"));
+                    }
                 }
             }
         }
+
+        // A batch where every task failed means something systemic is wrong
+        // (index blocked, CDN refusing, ...) — stop instead of looping forever.
+        if batch_failed > 0 && batch_ok == 0 {
+            tracing::warn!("batch produced no successful WARC(s); stopping before replanning");
+            break 'batches;
+        }
+
+        if !cfg.targets.unlimited {
+            break 'batches;
+        }
+        if *shutdown_rx.borrow() {
+            interrupted = true;
+            break 'batches;
+        }
+
+        // Plan the next batch: same budget, only WARCs outside the plan.
+        let exclude: HashSet<String> = planned.iter().map(|t| t.path.clone()).collect();
+        let more = cdx::select_warcs(&cfg, &net, &stats, &exclude).await?;
+        if more.is_empty() {
+            tracing::info!("unlimited: no unseen candidates remain in the index; finishing");
+            break 'batches;
+        }
+        tracing::info!(
+            batch,
+            new_warcs = more.len(),
+            "unlimited: plan drained — scheduling another batch"
+        );
+        {
+            let mut g = cp.lock().unwrap_or_else(|e| e.into_inner());
+            g.targets.extend(more.iter().cloned());
+            g.save(&cfg)?;
+        }
+        planned.extend(more);
     }
 
     if interrupted {
@@ -197,7 +249,7 @@ async fn main() -> Result<()> {
         &assembled,
         ok,
         failed,
-        cached,
+        cached_total,
         cfg.scan.only_verified,
     );
     for e in &errors {
